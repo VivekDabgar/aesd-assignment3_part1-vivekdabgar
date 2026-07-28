@@ -1,21 +1,34 @@
-# Cross-compilation default set up
-CROSS_COMPILE ?=
-CC = $(CROSS_COMPILE)gcc
+# Makefile for writer.c
 
-# Source and object file dsefinitions
-SRCS = writer.c
-OBJS = $(SRCS:.c=.o)
-TARGET = writer
+INCLUDE_DIRS = 
+LIB_DIRS = 
+# CROSS_COMPILE variable initially set to nothing. Will be over-written if value is passed in the command-line.
+CROSS_COMPILE ?= 
+CC=$(CROSS_COMPILE)gcc
 
-# Default target: build the app
-all: $(TARGET)
+CDEFS=
+# Compile at O0 by default
+CFLAGS= -O0 -g $(INCLUDE_DIRS) $(CDEFS)
+LIBS= 
 
-$(TARGET): $(OBJS)
-	$(CC) -o $(TARGET) $(OBJS)
+HFILES= 
+CFILES= writer.c
 
-%.o: %.c
-	$(CC) -c $< -o $@
+SRCS= ${HFILES} ${CFILES}
+OBJS= ${CFILES:.c=.o}
 
-# clean target: remove binary and object files
+all:	writer
+
+# Remove all .o files and the writer executable
 clean:
-	rm -f $(TARGET) $(OBJS)
+	-rm -f *.o *.d
+	-rm -f writer
+
+# native build if no args are passed, build for the specified target in case args are passed.
+writer: writer.o
+	$(CC) $(LDFLAGS) $(CFLAGS) -o $@ $^
+
+depend:
+
+.c.o:
+	$(CC) $(CFLAGS) -c $<
