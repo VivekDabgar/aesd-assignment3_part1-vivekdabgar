@@ -1,0 +1,3 @@
+aesdsocket
+*.o
+valgrind-out.txt
