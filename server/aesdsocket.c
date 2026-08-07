@@ -1,94 +1,88 @@
 /*
- * aesdsocket.c
+ * aesdsocket.c  --  AESD Assignment 6
  *
- * AESD Assignment 5 - stream socket server on port 9000.
- *
- * Behaviour:
- *   - binds a TCP stream socket to port 9000
- *   - accepts one client at a time, forever
- *   - every newline-terminated packet received is appended to
- *     /var/tmp/aesdsocketdata
- *   - after each complete packet the whole file is streamed back to the client
- *   - SIGINT / SIGTERM cause a graceful shutdown and delete the data file
- *   - "-d" runs the server as a daemon (fork happens only after bind succeeds)
+ * Assignment 5 behaviour, plus:
+ *   STEP 1  connection work moved out of main() into connection_handler()
+ *   STEP 2  per-thread "box of stuff"  (struct thread_data)
+ *   STEP 3  singly linked list (sys/queue.h) = the manager's clipboard
+ *   STEP 4  one mutex = the single pen for the shared logbook
+ *   STEP 5  POSIX timer appends "timestamp:<RFC 2822>" every 10 seconds
+ *   STEP 6  graceful shutdown: wake accept(), join every thread, clean up
  */
-
-#define _GNU_SOURCE
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-#include <unistd.h>
 #include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <syslog.h>
-#include <fcntl.h>
-
+#include <time.h>
+#include <pthread.h>
 #include <sys/types.h>
-#include <sys/socket.h>
 #include <sys/stat.h>
-#include <netdb.h>
-#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/queue.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
 
-#define PORT        "9000"
-#define DATA_FILE   "/var/tmp/aesdsocketdata"
-#define BACKLOG     10
-#define BUF_SIZE    1024
+#define PORT            "9000"
+#define BACKLOG         10
+#define RX_BUFFER_SIZE  1024
+#define DATA_FILE       "/var/tmp/aesdsocketdata"
+#define TIMER_PERIOD_S  10
 
-/* ---------------- global state (needed by the signal handler) ------------- */
+/* ------------------------------------------------------------------ */
+/* STEP 2: everything one clerk needs to do their job, in one struct.  */
+/* ------------------------------------------------------------------ */
+struct thread_data {
+    pthread_t thread_id;
+    int       client_fd;
+    char      client_ip[INET6_ADDRSTRLEN];
+    bool      thread_complete;              /* "I'm done, sign me out" */
+    SLIST_ENTRY(thread_data) entries;       /* link on the clipboard   */
+};
 
-static volatile sig_atomic_t exit_requested = 0;
-static int sockfd   = -1;   /* listening socket   */
-static int clientfd = -1;   /* current client fd  */
+SLIST_HEAD(thread_list, thread_data);
 
-/* ---------------------------- signal handling ----------------------------- */
+/* ------------------------------------------------------------------ */
+/* Globals                                                            */
+/* ------------------------------------------------------------------ */
+static volatile sig_atomic_t caught_signal = 0;
 
+/* STEP 4: the single pen. Guards every touch of the data file.       */
+static pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int  data_fd   = -1;
+static int  listen_fd = -1;
+
+static timer_t timer_id;
+static bool    timer_created = false;
+
+static struct thread_list head = SLIST_HEAD_INITIALIZER(head);
+
+/* ------------------------------------------------------------------ */
+/* Small helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Signal handler: touch nothing but the flag. */
 static void signal_handler(int signo)
 {
     (void)signo;
-    exit_requested = 1;
-
-    /* shutdown() is async-signal-safe and unblocks a pending accept()/recv() */
-    if (clientfd != -1) {
-        shutdown(clientfd, SHUT_RDWR);
-    }
-    if (sockfd != -1) {
-        shutdown(sockfd, SHUT_RDWR);
-    }
+    caught_signal = 1;
 }
 
-static int setup_signals(void)
-{
-    struct sigaction sa;
-
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;                 /* no SA_RESTART: we want EINTR */
-
-    if (sigaction(SIGINT, &sa, NULL) != 0) {
-        return -1;
-    }
-    if (sigaction(SIGTERM, &sa, NULL) != 0) {
-        return -1;
-    }
-    return 0;
-}
-
-/* ------------------------------ small helpers ----------------------------- */
-
+/* write() can be short; keep going until the whole buffer is out. */
 static int write_all(int fd, const char *buf, size_t len)
 {
     size_t written = 0;
-
     while (written < len) {
         ssize_t n = write(fd, buf + written, len - written);
         if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
+            if (errno == EINTR) continue;
             return -1;
         }
         written += (size_t)n;
@@ -96,19 +90,14 @@ static int write_all(int fd, const char *buf, size_t len)
     return 0;
 }
 
+/* send() can be short too. */
 static int send_all(int fd, const char *buf, size_t len)
 {
     size_t sent = 0;
-
     while (sent < len) {
         ssize_t n = send(fd, buf + sent, len - sent, 0);
         if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -1;
-        }
-        if (n == 0) {
+            if (errno == EINTR) continue;
             return -1;
         }
         sent += (size_t)n;
@@ -117,283 +106,431 @@ static int send_all(int fd, const char *buf, size_t len)
 }
 
 /*
- * Stream the whole data file back to the client in BUF_SIZE chunks.
- * Chunking matters: the file may be larger than the heap we are allowed to use.
+ * Block/unblock SIGINT+SIGTERM in the *calling* thread.
+ *
+ * Why: new threads inherit the signal mask of their creator. We block
+ * before pthread_create() and before timer_create() so that only the
+ * main thread can ever receive the signal -- otherwise the signal might
+ * be delivered to a worker and accept() would never be interrupted.
  */
-static int send_file_to_client(int fd)
+static void set_sigmask(int how)
 {
-    char    buf[BUF_SIZE];
-    ssize_t nread;
-    int     filefd;
+    sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+    pthread_sigmask(how, &set, NULL);
+}
 
-    filefd = open(DATA_FILE, O_RDONLY);
-    if (filefd < 0) {
-        syslog(LOG_ERR, "open %s for read failed: %s", DATA_FILE, strerror(errno));
-        return -1;
+/* ------------------------------------------------------------------ */
+/* STEP 4: the only place the data file is ever touched.              */
+/*                                                                    */
+/* The append AND the read-back happen inside one lock, so another    */
+/* clerk (or the clock-keeper) can never slip a write in between.     */
+/* ------------------------------------------------------------------ */
+static int append_and_echo(int client_fd, const char *packet, size_t len)
+{
+    char    buf[RX_BUFFER_SIZE];
+    ssize_t nread;
+    int     rc = -1;
+
+    pthread_mutex_lock(&file_mutex);
+
+    if (write_all(data_fd, packet, len) != 0) {
+        syslog(LOG_ERR, "write to %s failed: %s", DATA_FILE, strerror(errno));
+        goto unlock;
     }
 
-    while ((nread = read(filefd, buf, sizeof(buf))) > 0) {
-        if (send_all(fd, buf, (size_t)nread) != 0) {
-            syslog(LOG_ERR, "send to client failed: %s", strerror(errno));
-            close(filefd);
-            return -1;
+    if (lseek(data_fd, 0, SEEK_SET) == (off_t)-1) {
+        syslog(LOG_ERR, "lseek failed: %s", strerror(errno));
+        goto unlock;
+    }
+
+    while ((nread = read(data_fd, buf, sizeof(buf))) > 0) {
+        if (send_all(client_fd, buf, (size_t)nread) != 0) {
+            syslog(LOG_ERR, "send failed: %s", strerror(errno));
+            goto unlock;
         }
     }
-
-    close(filefd);
-
     if (nread < 0) {
-        syslog(LOG_ERR, "read %s failed: %s", DATA_FILE, strerror(errno));
-        return -1;
+        syslog(LOG_ERR, "read failed: %s", strerror(errno));
+        goto unlock;
     }
-    return 0;
+
+    rc = 0;
+
+unlock:
+    /* Every exit path unlocks. A clerk who walks off with the pen
+       deadlocks the whole post office. */
+    pthread_mutex_unlock(&file_mutex);
+    return rc;
 }
 
-/* --------------------------- per-client handling -------------------------- */
-
-/*
- * Read from the client until it closes the connection.
- * Bytes are accumulated in a growing heap buffer; every time a '\n' shows up
- * the bytes up to and including it are appended to the data file and the whole
- * file is sent back.
- */
-static int handle_client(int fd)
+/* ------------------------------------------------------------------ */
+/* STEP 1: the clerk. One instance per client connection.             */
+/* ------------------------------------------------------------------ */
+static void *connection_handler(void *arg)
 {
-    char    recv_buf[BUF_SIZE];
-    char   *packet      = NULL;
-    size_t  packet_len  = 0;
-    ssize_t nread;
-    int     ret = 0;
+    struct thread_data *td = (struct thread_data *)arg;
 
-    while ((nread = recv(fd, recv_buf, sizeof(recv_buf), 0)) > 0) {
-        char *newline;
-        char *tmp = realloc(packet, packet_len + (size_t)nread + 1);
+    char   *packet      = NULL;   /* grows until a '\n' shows up */
+    size_t  packet_cap  = 0;
+    size_t  packet_used = 0;
+    char    rxbuf[RX_BUFFER_SIZE];
 
-        if (tmp == NULL) {
-            syslog(LOG_ERR, "malloc failed (%zu bytes), discarding packet",
-                   packet_len + (size_t)nread + 1);
-            free(packet);
-            packet     = NULL;
-            packet_len = 0;
-            continue;                  /* drop the over-length packet, keep going */
+    while (!caught_signal) {
+        ssize_t nread = recv(td->client_fd, rxbuf, sizeof(rxbuf), 0);
+
+        if (nread == 0) {
+            break;                              /* client closed */
         }
-        packet = tmp;
+        if (nread < 0) {
+            if (errno == EINTR) continue;
+            syslog(LOG_ERR, "recv failed: %s", strerror(errno));
+            break;
+        }
 
-        memcpy(packet + packet_len, recv_buf, (size_t)nread);
-        packet_len += (size_t)nread;
-        packet[packet_len] = '\0';
+        /* Grow the packet buffer to hold what just arrived. */
+        if (packet_used + (size_t)nread > packet_cap) {
+            size_t new_cap = packet_cap ? packet_cap : RX_BUFFER_SIZE;
+            while (new_cap < packet_used + (size_t)nread)
+                new_cap *= 2;
 
-        /* one buffer may contain several complete packets */
-        while ((newline = memchr(packet, '\n', packet_len)) != NULL) {
-            size_t line_len = (size_t)(newline - packet) + 1;
-            int    filefd;
-
-            filefd = open(DATA_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
-            if (filefd < 0) {
-                syslog(LOG_ERR, "open %s for append failed: %s",
-                       DATA_FILE, strerror(errno));
-                ret = -1;
-                goto out;
+            char *tmp = realloc(packet, new_cap);
+            if (tmp == NULL) {
+                /* Over-length packet: discard it and carry on. */
+                syslog(LOG_ERR, "realloc failed, discarding packet");
+                free(packet);
+                packet      = NULL;
+                packet_cap  = 0;
+                packet_used = 0;
+                continue;
             }
-            if (write_all(filefd, packet, line_len) != 0) {
-                syslog(LOG_ERR, "write %s failed: %s", DATA_FILE, strerror(errno));
-                close(filefd);
-                ret = -1;
-                goto out;
-            }
-            close(filefd);
+            packet     = tmp;
+            packet_cap = new_cap;
+        }
 
-            if (send_file_to_client(fd) != 0) {
-                ret = -1;
-                goto out;
-            }
+        memcpy(packet + packet_used, rxbuf, (size_t)nread);
+        packet_used += (size_t)nread;
 
-            /* shift the leftover (incomplete) bytes to the front */
-            memmove(packet, packet + line_len, packet_len - line_len);
-            packet_len -= line_len;
-            packet[packet_len] = '\0';
+        /* One recv() may carry several packets, or none at all. */
+        char *nl;
+        while ((nl = memchr(packet, '\n', packet_used)) != NULL) {
+            size_t pkt_len = (size_t)(nl - packet) + 1;
+
+            if (append_and_echo(td->client_fd, packet, pkt_len) != 0)
+                goto done;
+
+            packet_used -= pkt_len;
+            memmove(packet, packet + pkt_len, packet_used);
         }
     }
 
-    if (nread < 0 && errno != EINTR && !exit_requested) {
-        syslog(LOG_ERR, "recv failed: %s", strerror(errno));
-        ret = -1;
-    }
-
-out:
+done:
     free(packet);
-    return ret;
+    close(td->client_fd);
+    td->client_fd = -1;
+    syslog(LOG_DEBUG, "Closed connection from %s", td->client_ip);
+
+    /* Must be the very last thing: the manager reaps on this flag. */
+    td->thread_complete = true;
+    return td;
 }
 
-/* ------------------------------- daemonizing ------------------------------ */
-
-static int daemonize(void)
+/* ------------------------------------------------------------------ */
+/* STEP 5: the clock-keeper. Grabs the same pen as everyone else.     */
+/* ------------------------------------------------------------------ */
+static void timer_callback(union sigval sv)
 {
-    pid_t pid;
-    int   devnull;
+    (void)sv;
 
-    pid = fork();
-    if (pid < 0) {
-        syslog(LOG_ERR, "fork failed: %s", strerror(errno));
-        return -1;
-    }
-    if (pid > 0) {
-        exit(EXIT_SUCCESS);            /* parent leaves, shell gets its prompt back */
-    }
+    char       stamp[128];
+    char       line[160];
+    time_t     now = time(NULL);
+    struct tm  tm_now;
 
-    if (setsid() < 0) {                /* become session leader, drop the TTY */
-        syslog(LOG_ERR, "setsid failed: %s", strerror(errno));
-        return -1;
-    }
-    if (chdir("/") < 0) {              /* do not hold any directory busy */
-        syslog(LOG_ERR, "chdir failed: %s", strerror(errno));
-        return -1;
-    }
+    if (localtime_r(&now, &tm_now) == NULL)
+        return;
 
-    devnull = open("/dev/null", O_RDWR);
-    if (devnull < 0) {
-        syslog(LOG_ERR, "open /dev/null failed: %s", strerror(errno));
+    /* RFC 2822: "Thu, 06 Aug 2026 14:30:00 +0200" */
+    if (strftime(stamp, sizeof(stamp), "%a, %d %b %Y %T %z", &tm_now) == 0)
+        return;
+
+    int len = snprintf(line, sizeof(line), "timestamp:%s\n", stamp);
+    if (len <= 0)
+        return;
+
+    pthread_mutex_lock(&file_mutex);
+    if (write_all(data_fd, line, (size_t)len) != 0)
+        syslog(LOG_ERR, "timestamp write failed: %s", strerror(errno));
+    pthread_mutex_unlock(&file_mutex);
+}
+
+static int start_timer(void)
+{
+    struct sigevent   sev;
+    struct itimerspec its;
+
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify          = SIGEV_THREAD;
+    sev.sigev_notify_function = timer_callback;
+
+    if (timer_create(CLOCK_MONOTONIC, &sev, &timer_id) != 0) {
+        syslog(LOG_ERR, "timer_create failed: %s", strerror(errno));
         return -1;
     }
-    dup2(devnull, STDIN_FILENO);
-    dup2(devnull, STDOUT_FILENO);
-    dup2(devnull, STDERR_FILENO);
-    if (devnull > STDERR_FILENO) {
-        close(devnull);
+    timer_created = true;
+
+    its.it_value.tv_sec     = TIMER_PERIOD_S;
+    its.it_value.tv_nsec    = 0;
+    its.it_interval.tv_sec  = TIMER_PERIOD_S;
+    its.it_interval.tv_nsec = 0;
+
+    if (timer_settime(timer_id, 0, &its, NULL) != 0) {
+        syslog(LOG_ERR, "timer_settime failed: %s", strerror(errno));
+        return -1;
     }
     return 0;
 }
 
-/* --------------------------------- cleanup -------------------------------- */
-
-static void cleanup(void)
+/* ------------------------------------------------------------------ */
+/* STEP 3: walk the clipboard and sign out anyone who has finished.   */
+/*                                                                    */
+/* force == false : only reap threads that set thread_complete        */
+/* force == true  : shutdown + join everybody (shutdown time)         */
+/* ------------------------------------------------------------------ */
+static void reap_threads(bool force)
 {
-    if (clientfd != -1) {
-        close(clientfd);
-        clientfd = -1;
+    struct thread_data *entry = SLIST_FIRST(&head);
+    struct thread_data *next;
+
+    while (entry != NULL) {
+        next = SLIST_NEXT(entry, entries);
+
+        if (force || entry->thread_complete) {
+            /* Nudge a thread still parked in recv() so it returns. */
+            if (force && entry->client_fd >= 0)
+                shutdown(entry->client_fd, SHUT_RDWR);
+
+            pthread_join(entry->thread_id, NULL);
+            SLIST_REMOVE(&head, entry, thread_data, entries);
+            free(entry);
+        }
+        entry = next;
     }
-    if (sockfd != -1) {
-        close(sockfd);
-        sockfd = -1;
-    }
-    unlink(DATA_FILE);
-    closelog();
 }
 
-/* ----------------------------------- main --------------------------------- */
-
-int main(int argc, char **argv)
+/* ------------------------------------------------------------------ */
+/* Setup helpers                                                      */
+/* ------------------------------------------------------------------ */
+static int setup_socket(void)
 {
-    bool             daemon_mode = false;
-    struct addrinfo  hints;
-    struct addrinfo *servinfo = NULL;
-    int              yes = 1;
-    int              rc;
+    struct addrinfo hints, *res = NULL;
+    int fd = -1, yes = 1, rc;
 
-    openlog("aesdsocket", LOG_PID, LOG_USER);
-
-    /* ---- argument parsing ---- */
-    if (argc == 2 && strcmp(argv[1], "-d") == 0) {
-        daemon_mode = true;
-    } else if (argc > 1) {
-        syslog(LOG_ERR, "usage: aesdsocket [-d]");
-        fprintf(stderr, "usage: %s [-d]\n", argv[0]);
-        closelog();
-        return -1;
-    }
-
-    if (setup_signals() != 0) {
-        syslog(LOG_ERR, "sigaction failed: %s", strerror(errno));
-        closelog();
-        return -1;
-    }
-
-    /* ---- resolve the local address to bind to ---- */
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags    = AI_PASSIVE;
 
-    rc = getaddrinfo(NULL, PORT, &hints, &servinfo);
+    rc = getaddrinfo(NULL, PORT, &hints, &res);
     if (rc != 0) {
         syslog(LOG_ERR, "getaddrinfo failed: %s", gai_strerror(rc));
-        closelog();
         return -1;
     }
 
-    /* ---- socket ---- */
-    sockfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
-    if (sockfd < 0) {
+    fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
         syslog(LOG_ERR, "socket failed: %s", strerror(errno));
-        freeaddrinfo(servinfo);
+        goto err;
+    }
+
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) != 0) {
+        syslog(LOG_ERR, "setsockopt failed: %s", strerror(errno));
+        goto err;
+    }
+
+    if (bind(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        syslog(LOG_ERR, "bind failed: %s", strerror(errno));
+        goto err;
+    }
+
+    freeaddrinfo(res);
+    return fd;
+
+err:
+    if (fd >= 0) close(fd);
+    freeaddrinfo(res);
+    return -1;
+}
+
+static int install_signal_handlers(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    /* NOTE: no SA_RESTART -- we WANT accept() to return EINTR. */
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) != 0) return -1;
+    if (sigaction(SIGTERM, &sa, NULL) != 0) return -1;
+    return 0;
+}
+
+static int daemonize(void)
+{
+    pid_t pid = fork();
+    if (pid < 0) {
+        syslog(LOG_ERR, "fork failed: %s", strerror(errno));
+        return -1;
+    }
+    if (pid > 0)
+        exit(EXIT_SUCCESS);        /* parent leaves */
+
+    if (setsid() < 0) {
+        syslog(LOG_ERR, "setsid failed: %s", strerror(errno));
+        return -1;
+    }
+
+    if (chdir("/") != 0)
+        syslog(LOG_WARNING, "chdir(/) failed: %s", strerror(errno));
+
+    int devnull = open("/dev/null", O_RDWR);
+    if (devnull >= 0) {
+        dup2(devnull, STDIN_FILENO);
+        dup2(devnull, STDOUT_FILENO);
+        dup2(devnull, STDERR_FILENO);
+        if (devnull > STDERR_FILENO)
+            close(devnull);
+    }
+    return 0;
+}
+
+static void cleanup(void)
+{
+    if (timer_created)
+        timer_delete(timer_id);
+
+    reap_threads(true);            /* STEP 6: everybody goes home */
+
+    if (listen_fd >= 0) close(listen_fd);
+    if (data_fd   >= 0) close(data_fd);
+
+    pthread_mutex_destroy(&file_mutex);
+    unlink(DATA_FILE);
+    closelog();
+}
+
+/* ------------------------------------------------------------------ */
+/* main: hire clerks, never do the work itself                        */
+/* ------------------------------------------------------------------ */
+int main(int argc, char *argv[])
+{
+    bool daemon_mode = (argc == 2 && strcmp(argv[1], "-d") == 0);
+
+    openlog("aesdsocket", LOG_PID, LOG_USER);
+
+    if (install_signal_handlers() != 0) {
+        syslog(LOG_ERR, "sigaction failed: %s", strerror(errno));
         closelog();
         return -1;
     }
 
-    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) != 0) {
-        syslog(LOG_ERR, "setsockopt failed: %s", strerror(errno));
-        freeaddrinfo(servinfo);
-        cleanup();
+    listen_fd = setup_socket();
+    if (listen_fd < 0) {
+        closelog();
+        return -1;                 /* required: -1 on setup failure */
+    }
+
+    /* Daemonize AFTER a successful bind... */
+    if (daemon_mode && daemonize() != 0) {
+        close(listen_fd);
+        closelog();
         return -1;
     }
 
-    /* ---- bind ---- */
-    if (bind(sockfd, servinfo->ai_addr, servinfo->ai_addrlen) != 0) {
-        syslog(LOG_ERR, "bind failed: %s", strerror(errno));
-        freeaddrinfo(servinfo);
-        cleanup();
-        return -1;
-    }
-    freeaddrinfo(servinfo);
-    servinfo = NULL;
+    /* ...and everything below happens in the CHILD.
+       fork() does not inherit POSIX timers or threads. Start the timer
+       in the parent and it silently disappears -- zero timestamps. */
 
-    /* ---- daemonize only AFTER a successful bind ---- */
-    if (daemon_mode) {
-        if (daemonize() != 0) {
-            cleanup();
-            return -1;
-        }
-    }
-
-    /* ---- listen ---- */
-    if (listen(sockfd, BACKLOG) != 0) {
+    if (listen(listen_fd, BACKLOG) != 0) {
         syslog(LOG_ERR, "listen failed: %s", strerror(errno));
-        cleanup();
+        close(listen_fd);
+        closelog();
         return -1;
     }
 
-    /* ---- accept loop ---- */
-    while (!exit_requested) {
+    data_fd = open(DATA_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+    if (data_fd < 0) {
+        syslog(LOG_ERR, "open %s failed: %s", DATA_FILE, strerror(errno));
+        close(listen_fd);
+        closelog();
+        return -1;
+    }
+
+    SLIST_INIT(&head);
+
+    /* Timer helper thread must not catch our signals either. */
+    set_sigmask(SIG_BLOCK);
+    if (start_timer() != 0) {
+        set_sigmask(SIG_UNBLOCK);
+        cleanup();
+        return -1;
+    }
+    set_sigmask(SIG_UNBLOCK);
+
+    /* ---------------- accept loop ---------------- */
+    while (!caught_signal) {
         struct sockaddr_in client_addr;
         socklen_t          addr_len = sizeof(client_addr);
-        char               ip_str[INET_ADDRSTRLEN];
 
-        clientfd = accept(sockfd, (struct sockaddr *)&client_addr, &addr_len);
-        if (clientfd < 0) {
-            if (errno == EINTR || exit_requested) {
-                break;
-            }
+        /* Block here. Do NOT poll -- a busy loop starves the workers
+           under valgrind and the multithread test fails. */
+        int client_fd = accept(listen_fd,
+                               (struct sockaddr *)&client_addr,
+                               &addr_len);
+        if (client_fd < 0) {
+            if (errno == EINTR) continue;          /* signal woke us */
             syslog(LOG_ERR, "accept failed: %s", strerror(errno));
             continue;
         }
 
-        if (inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str)) == NULL) {
-            strncpy(ip_str, "unknown", sizeof(ip_str));
-            ip_str[sizeof(ip_str) - 1] = '\0';
+        struct thread_data *td = calloc(1, sizeof(struct thread_data));
+        if (td == NULL) {
+            syslog(LOG_ERR, "calloc failed for thread data");
+            close(client_fd);
+            continue;
         }
-        syslog(LOG_INFO, "Accepted connection from %s", ip_str);
 
-        handle_client(clientfd);
+        td->client_fd       = client_fd;
+        td->thread_complete = false;
+        inet_ntop(AF_INET, &client_addr.sin_addr,
+                  td->client_ip, sizeof(td->client_ip));
 
-        close(clientfd);
-        clientfd = -1;
-        syslog(LOG_INFO, "Closed connection from %s", ip_str);
+        syslog(LOG_DEBUG, "Accepted connection from %s", td->client_ip);
+
+        /* Worker inherits a mask with SIGINT/SIGTERM blocked. */
+        set_sigmask(SIG_BLOCK);
+        int rc = pthread_create(&td->thread_id, NULL, connection_handler, td);
+        set_sigmask(SIG_UNBLOCK);
+
+        if (rc != 0) {
+            syslog(LOG_ERR, "pthread_create failed: %s", strerror(rc));
+            close(client_fd);
+            free(td);
+            continue;
+        }
+
+        SLIST_INSERT_HEAD(&head, td, entries);
+
+        /* Sign out anyone who finished while we were busy. Done right
+           after starting the new thread, not in a polling loop. */
+        reap_threads(false);
     }
 
-    if (exit_requested) {
-        syslog(LOG_INFO, "Caught signal, exiting");
-    }
-
+    syslog(LOG_DEBUG, "Caught signal, exiting");
     cleanup();
     return 0;
 }
